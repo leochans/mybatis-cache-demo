@@ -1,0 +1,14 @@
+spring:
+  sql:
+    init:
+      mode: always
+  datasource:
+    driver-class-name: org.h2.Driver
+    url: jdbc:h2:mem:demo;DB_CLOSE_DELAY=-1;MODE=MYSQL
+    username: sa
+    password:
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
