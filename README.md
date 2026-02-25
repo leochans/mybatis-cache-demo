@@ -141,6 +141,79 @@ if (holder != null && holder.getSqlSession() == session) {
 7. `createSnapshot` 对该实例做 `setId`、`setCategoryId` 等修改  
 8. 回到 `placeOrder()`，它持有的 `productPo` 与 `createSnapshot` 改的是同一对象 → 出现「意外修改」
 
+**时序图（有事务）：**
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant O as OrderService
+    participant P as ProductCopyService
+    participant M as ProductMapper
+    participant SS as SqlSessionUtils
+    participant SS1 as SqlSession #1
+    participant Cache as localCache
+
+    Note over C,Cache: @Transactional 下，整个请求共用同一个 SqlSession
+
+    C->>O: placeOrder(1)
+    activate O
+    O->>M: selectById(1)
+    M->>SS: getSqlSession()
+    SS->>SS: 事务开启，创建并绑定 SqlSession
+    SS-->>M: SqlSession #1
+    M->>SS1: query()
+    SS1->>Cache: getObject(key) → 未命中
+    SS1->>SS1: queryFromDatabase() → 查库
+    SS1->>Cache: putObject(key, list)
+    Note over Cache: 缓存 [ProductPo@0x001]
+    SS1-->>M: List([ProductPo])
+    M-->>O: productPo (引用 0x001)
+
+    O->>P: createSnapshot(1)
+    activate P
+    P->>M: selectById(1)
+    M->>SS: getSqlSession()
+    SS->>SS: 同一事务，返回已绑定的 SqlSession
+    SS-->>M: SqlSession #1 (同一实例)
+    M->>SS1: query()
+    SS1->>Cache: getObject(key) → 命中！
+    Cache-->>SS1: List([ProductPo@0x001])
+    Note over SS1,Cache: 返回的是【同一个对象引用】
+    SS1-->>M: List([ProductPo])
+    M-->>P: productPo (引用 0x001，与 placeOrder 中的是同一实例)
+
+    P->>P: setId/setCategoryId/setName 修改对象
+    Note over P: 修改的是 0x001，placeOrder 持有的也是 0x001
+    P->>M: insert(productPo)
+    P-->>O: return
+    deactivate P
+
+    O->>O: productPo.getId() 等
+    Note over O: 此时 productPo 已被 createSnapshot 改过！
+    O-->>C: DemoResult(dataCorrupted=true)
+    deactivate O
+```
+
+**流程图（对象引用关系）：**
+
+```mermaid
+flowchart TB
+    subgraph 有事务
+        A[placeOrder 调用 selectById] --> B[SqlSession #1 查库]
+        B --> C[结果放入 localCache]
+        C --> D[返回 productPo 引用 0x001]
+        D --> E[调用 createSnapshot]
+        E --> F[createSnapshot 调用 selectById]
+        F --> G[复用同一 SqlSession #1]
+        G --> H[localCache 命中]
+        H --> I[返回同一 productPo 引用 0x001]
+        I --> J[createSnapshot 修改对象]
+        J --> K[placeOrder 持有的 productPo 也被修改]
+    end
+
+    style K fill:#ffcccc
+```
+
 ---
 
 ### 四、不在事务里会不会有这个问题？—— 不会
@@ -153,6 +226,89 @@ if (holder != null && holder.getSqlSession() == session) {
 4. 对这份对象做修改，不会影响之前 `placeOrder` 里的那一份  
 
 因此：**不在事务中，每次 mapper 调用会使用不同的 SqlSession，从而不会共享一级缓存，也就不会出现「先查后改、误改原对象」的问题**。
+
+**时序图（无事务）：**
+
+```mermaid
+sequenceDiagram
+    participant C as Controller
+    participant O as OrderService
+    participant P as ProductCopyService
+    participant M as ProductMapper
+    participant SS as SqlSessionUtils
+    participant SS1 as SqlSession #1
+    participant SS2 as SqlSession #2
+    participant DB as Database
+
+    Note over C,DB: 无 @Transactional，每次 mapper 调用独立 SqlSession
+
+    C->>O: placeOrder(1)
+    activate O
+    O->>M: selectById(1)
+    M->>SS: getSqlSession()
+    SS->>SS1: openSession() 新建
+    SS-->>M: SqlSession #1
+    M->>SS1: query()
+    SS1->>DB: SELECT ...
+    DB-->>SS1: 数据
+    SS1->>SS1: putObject → localCache #1
+    SS1-->>M: List([ProductPo@0x001])
+    M-->>O: productPo (引用 0x001)
+    M->>SS: closeSqlSession(#1)
+    SS->>SS1: close() 非事务，立即关闭
+    Note over SS1: SqlSession #1 及 localCache #1 销毁
+
+    O->>P: createSnapshot(1)
+    activate P
+    P->>M: selectById(1)
+    M->>SS: getSqlSession()
+    SS->>SS2: openSession() 再次新建
+    SS-->>M: SqlSession #2 (全新)
+    M->>SS2: query()
+    SS2->>SS2: localCache #2 为空，未命中
+    SS2->>DB: SELECT ... 重新查库
+    DB-->>SS2: 数据
+    SS2->>SS2: putObject → localCache #2
+    SS2-->>M: List([ProductPo@0x002])
+    Note over M,SS2: 新对象 0x002，与 0x001 是不同实例
+    M-->>P: productPo (引用 0x002)
+
+    P->>P: setId/setCategoryId 修改 0x002
+    Note over P: 仅修改 0x002，placeOrder 持有的是 0x001，不受影响
+    P->>M: insert(productPo)
+    M->>SS: closeSqlSession(#2)
+    SS->>SS2: close()
+    P-->>O: return
+    deactivate P
+
+    O->>O: productPo.getId() 等
+    Note over O: productPo 仍是 0x001，未被修改
+    O-->>C: DemoResult(dataCorrupted=false)
+    deactivate O
+```
+
+**流程图（有事务 vs 无事务对比）：**
+
+```mermaid
+flowchart LR
+    subgraph 有事务["有 @Transactional"]
+        T1[placeOrder selectById] --> T2[SqlSession #1]
+        T2 --> T3[localCache]
+        T4[createSnapshot selectById] --> T2
+        T2 --> T3
+        T3 -.->|"同一引用"| T5[对象被意外修改]
+    end
+
+    subgraph 无事务["无 @Transactional"]
+        N1[placeOrder selectById] --> N2[SqlSession #1]
+        N2 --> N3[localCache #1]
+        N2 --> N4[close 销毁]
+        N5[createSnapshot selectById] --> N6[SqlSession #2 新建]
+        N6 --> N7[localCache #2 空]
+        N6 --> N8[重新查库]
+        N8 -.->|"不同实例"| N9[互不影响 ✓]
+    end
+```
 
 ---
 
